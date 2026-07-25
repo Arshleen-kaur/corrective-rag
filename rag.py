@@ -44,18 +44,84 @@ llm = ChatOpenAI(
     temperature=0
 )
 
+UPPER_TH =0.7
+LOWER_TH =0.3
+
 class State(TypedDict):
     question: str
     docs: List[Document]
+
+    good_docs: List[Document]
+    verdict: str
+    reason:str
+
     strips: List[str]
     kept_strips: List[str]
     refined_context: str
+
     answer: str
 
 
 def retrieve(state):
     q=state["question"]
     return {"docs":retriever.invoke(q)}
+
+class DocEvalScore(BaseModel):
+    score:float
+    reason: str
+doc_eval_prompt= ChatPromptTemplate.from_messages(
+    [
+        ("system",
+         "You are a strict retrieval evaluator for RAG.\n"
+         "You will be given one retrieval chunk and a question.\n"
+         "Return relevance score in [0.0,1.0]\n"
+         "1.0: chunk is fully sufficient to answer the question\n"
+         "0.0 chunk is irrelevant\n"
+         "Be conservative with high scores.\n"
+         "Also return a short reason\n"
+         "output json only"),
+         ("human","question: {question}\n\n chunk:{chunk}")
+    ]
+)
+doc_eval_chain=doc_eval_prompt|llm.with_structured_output(DocEvalScore)
+
+def eval_each_doc_node(state:State)->State:
+
+    q=state["question"]
+
+    scores:List[float]
+    reasons:List[str]
+    good:List[Document]
+
+    for d in state["docs"]:
+        out=doc_eval_chain.invoke({"question":q,"chunk":d.page_content})
+        scores.append(out.score)
+        reasons.append(out.reason)
+
+        if out.score>LOWER_TH:
+            good.append(d)
+
+    if any(s>UPPER_TH for s in scores):
+        return {
+            "good_docs":good,
+            "verdict":"CORRECT",
+            "reason" : f"At least one retrieved chunk stored > {UPPER_TH}.{why}",
+
+        }
+    if len(scores)>0 and all(s<LOWER_TH for s in scores):
+        why ="No chunk was sufficeient"
+        return {
+            "good_docs":[],
+            "verdict":"INCORRECT",
+            "reason":f"All retrieved chunks scored <{LOWER_TH}.{why}",
+
+        }
+    why="Mixed relevance signals"
+    return {
+        "good_docs":good,
+        "verdict":"AMBIGUOUS",
+        "reason": F"No chunks scored >{UPPER_TH }, but not all were <{LOWER_TH}.{why}",
+    }
 
 def decompose_to_sentences(text:str)->List[str]:
     text=re.sub(r"\s+", " ", text).strip()
@@ -74,7 +140,7 @@ filter_chain=filter_prompt | llm.with_structured_output(KeepOrDrop)
 
 def refine(state:State)->State:
     q=state["question"]
-    context="\n\n".join(d.page_content for d in state["docs"]).strip()
+    context="\n\n".join(d.page_content for d in state["good_docs"]).strip()
     strips=decompose_to_sentences(context)
     kept:List[str]=[]
     for s in strips:
@@ -97,13 +163,35 @@ def generate(state):
     context="\,\n".join([d.page_content for d in state["docs"]])
     out=(prompt|llm).invoke({"question":state["question"],"context":context})
     return {"answer":out["text"]}
+
+def fail_node(state:State)->State:
+    return {"answer": f"FAIL : {state['reason']}"}
+def ambiguous_node(state:State)->State:
+    return {"answer":f"Ambiguous : {state['reason']}"}
+def router_after_eval(state:State)->str:
+    if state["verdict"]=="CORRECT":
+        return "refine"
+    elif state["verdict"]=="INCORRECT":
+        return "fail_node"
+    else:
+        return "ambiguous"
 g=StateGraph(State)
 g.add_node("retrieve", retrieve)
+g.add_node("eval_each_doc",eval_each_doc_node)
 g.add_node("generate", generate)
 g.add_node("refine", refine)
+g.add_node("fail",fail_node)
+g.add_node("ambiguous",ambiguous_node)
 g.add_edge(START, "retrieve")
-g.add_edge("retrieve", "refine")
+g.add_edge("retrieve", "eval_each_doc")
+g.add_conditional_edges(
+    "eval_each_doc",
+    router_after_eval,
+    {"refine":"refine", "web_search":"fail","ambiguous":"ambiguous"}
+
+)
 g.add_edge("refine","generate")
 g.add_edge("generate", END)
+g.add_edge("fail",END)
 app=g.compile()
 
